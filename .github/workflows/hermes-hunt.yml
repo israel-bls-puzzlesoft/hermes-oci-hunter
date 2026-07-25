@@ -1,0 +1,117 @@
+name: Hermes A1 capacity hunt
+
+# Hunts for Oracle Cloud Always-Free Ampere A1 capacity in il-jerusalem-1 and
+# relaunches the Hermes instance from its preserved boot volume.
+# Self-disables the moment it succeeds, so it can never launch a second VM.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 min (GitHub often delays this under load)
+  workflow_dispatch:         # lets you run it manually from the Actions tab
+
+permissions:
+  actions: write             # needed to disable this workflow after success
+
+concurrency:
+  group: hermes-hunt         # never let two runs launch at the same time
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+      NTFY_TOPIC:          ${{ secrets.NTFY_TOPIC }}
+      COMPARTMENT: ${{ secrets.OCI_CLI_TENANCY }}
+      BOOT_VOLUME: ocid1.bootvolume.oc1.il-jerusalem-1.abwxiljrlij455dskphzybdmdeasjw4djucfwwjq46clwyd5zeximst5ubwa
+      SUBNET:      ocid1.subnet.oc1.il-jerusalem-1.aaaaaaaajejnljwr6hqqfvkj3ccbdgfrdkgde6umkmreiqjvgyk5skvdvlmq
+      AD:          'avPc:IL-JERUSALEM-1-AD-1'
+
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      # SAFETY: if an instance already exists, never launch another one.
+      - name: Bail out if Hermes is already running
+        id: guard
+        run: |
+          EXISTING=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT" --auth api_key \
+            --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].id" \
+            --raw-output 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "[]" ]; then
+            echo "An instance already exists - disabling hunt."
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt launch (2 OCPU / 12 GB = Always Free ceiling)
+        id: launch
+        if: steps.guard.outputs.already == 'false'
+        run: |
+          set +e
+          OUT=$(oci compute instance launch \
+            --auth api_key \
+            --availability-domain "$AD" \
+            --compartment-id "$COMPARTMENT" \
+            --shape VM.Standard.A1.Flex \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BOOT_VOLUME\"}" \
+            --subnet-id "$SUBNET" \
+            --assign-public-ip true \
+            --display-name Hermes 2>&1)
+          echo "$OUT" | grep -v SyntaxWarning | grep -v INSTANCE_CONSOLE | head -20
+
+          if echo "$OUT" | grep -q '"lifecycle-state"'; then
+            ID=$(echo "$OUT" | grep -o 'ocid1\.instance[^"]*' | head -1)
+            echo "booked=true"        >> "$GITHUB_OUTPUT"
+            echo "instance_id=$ID"    >> "$GITHUB_OUTPUT"
+          elif echo "$OUT" | grep -q 'Out of host capacity'; then
+            echo "booked=false" >> "$GITHUB_OUTPUT"
+            echo "No capacity this round - will retry on next schedule."
+          elif echo "$OUT" | grep -qi 'NotAuthenticated\|Unauthorized'; then
+            echo "booked=error" >> "$GITHUB_OUTPUT"
+            echo "AUTH FAILURE - check the OCI_CLI_* secrets."
+          else
+            echo "booked=false" >> "$GITHUB_OUTPUT"
+            echo "Other error (see above) - will retry."
+          fi
+          exit 0
+
+      - name: Fetch public IP
+        id: ip
+        if: steps.launch.outputs.booked == 'true'
+        run: |
+          sleep 30
+          IP=$(oci compute instance list-vnics --auth api_key \
+                --instance-id "${{ steps.launch.outputs.instance_id }}" \
+                --query 'data[0]."public-ip"' --raw-output 2>/dev/null || echo "pending")
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Public IP: $IP"
+
+      - name: Notify phone
+        if: steps.launch.outputs.booked == 'true' && env.NTFY_TOPIC != ''
+        run: |
+          curl -s -H "Title: Hermes is UP" -H "Priority: high" -H "Tags: white_check_mark" \
+            -d "Instance booked. Public IP: ${{ steps.ip.outputs.ip }}" \
+            "https://ntfy.sh/${NTFY_TOPIC}" > /dev/null
+
+      - name: Notify on auth failure
+        if: steps.launch.outputs.booked == 'error' && env.NTFY_TOPIC != ''
+        run: |
+          curl -s -H "Title: Hermes hunt broken" -H "Priority: high" -H "Tags: warning" \
+            -d "OCI auth failed - check the API key secrets." \
+            "https://ntfy.sh/${NTFY_TOPIC}" > /dev/null
+
+      # Stop the cron once we have the box (or if one already existed).
+      - name: Disable this workflow
+        if: steps.launch.outputs.booked == 'true' || steps.guard.outputs.already == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable "${{ github.workflow }}" --repo "${{ github.repository }}"
