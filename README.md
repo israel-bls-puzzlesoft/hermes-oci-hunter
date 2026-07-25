@@ -23,10 +23,14 @@ In the OCI Console (region **Israel Central (Jerusalem)**):
 2. **Groups → Create group** `hermes-launchers`, add that user to it
 3. **Policies → Create policy** in the root compartment, `hermes-launch-policy`:
    ```
-   Allow group hermes-launchers to manage instances in tenancy
-   Allow group hermes-launchers to use volume-family in tenancy
+   Allow group hermes-launchers to manage instance-family in tenancy
+   Allow group hermes-launchers to manage volume-family in tenancy
    Allow group hermes-launchers to use virtual-network-family in tenancy
    ```
+   `instance-family` (not bare `instances`) is required: launching from an
+   existing boot volume creates a **boot-volume-attachment**, which bare
+   `instances` does not cover. With the narrower form the launch fails with
+   `NotAuthorizedOrNotFound`.
 4. **Users → hermes-launcher → API keys → Add API key → Generate API key pair**
    → **Download the private key**, click Add, and copy the config snippet
    (it contains the user OCID and fingerprint).
