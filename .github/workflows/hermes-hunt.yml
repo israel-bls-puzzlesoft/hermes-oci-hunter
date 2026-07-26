@@ -61,18 +61,29 @@ jobs:
           set +e
           DEADLINE=$(( $(date +%s) + 3000 ))
           ATTEMPT=0
+          # Each cycle asks for the full 2/12 first, then falls back to 1/6.
+          # A smaller ask fits gaps the larger one cannot; both are Always Free
+          # (at or under the 2 OCPU / 12 GB ceiling), so neither can bill you.
           while :; do
-            ATTEMPT=$(( ATTEMPT + 1 ))
-            OUT=$(oci compute instance launch \
-              --auth api_key \
-              --availability-domain "$AD" \
-              --compartment-id "$COMPARTMENT" \
-              --shape VM.Standard.A1.Flex \
-              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BOOT_VOLUME\"}" \
-              --subnet-id "$SUBNET" \
-              --assign-public-ip true \
-              --display-name Hermes 2>&1)
+            for CFG in "2 12" "1 6"; do
+              set -- $CFG
+              OCPUS=$1; MEM=$2
+              ATTEMPT=$(( ATTEMPT + 1 ))
+              OUT=$(oci compute instance launch \
+                --auth api_key \
+                --availability-domain "$AD" \
+                --compartment-id "$COMPARTMENT" \
+                --shape VM.Standard.A1.Flex \
+                --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM}" \
+                --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BOOT_VOLUME\"}" \
+                --subnet-id "$SUBNET" \
+                --assign-public-ip true \
+                --display-name Hermes 2>&1)
+              echo "attempt $ATTEMPT (${OCPUS} OCPU / ${MEM} GB):"
+              if echo "$OUT" | grep -q '"lifecycle-state"'; then break; fi
+              if echo "$OUT" | grep -qiE 'NotAuthenticated|Unauthorized|LimitExceeded|QuotaExceeded'; then break; fi
+              sleep 15
+            done
 
             if echo "$OUT" | grep -q '"lifecycle-state"'; then
               echo "attempt $ATTEMPT: BOOKED"
