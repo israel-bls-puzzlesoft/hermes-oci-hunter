@@ -19,7 +19,7 @@ concurrency:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     env:
       OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
       OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
@@ -51,21 +51,55 @@ jobs:
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Attempt launch (2 OCPU / 12 GB = Always Free ceiling)
+      # Loops internally for ~50 min at 3-min intervals. GitHub's cron is
+      # best-effort and often delivers only a few runs a day, so density has to
+      # come from inside the job rather than from the scheduler.
+      - name: Hunt for capacity (loops ~50 min)
         id: launch
         if: steps.guard.outputs.already == 'false'
         run: |
           set +e
-          OUT=$(oci compute instance launch \
-            --auth api_key \
-            --availability-domain "$AD" \
-            --compartment-id "$COMPARTMENT" \
-            --shape VM.Standard.A1.Flex \
-            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-            --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BOOT_VOLUME\"}" \
-            --subnet-id "$SUBNET" \
-            --assign-public-ip true \
-            --display-name Hermes 2>&1)
+          DEADLINE=$(( $(date +%s) + 3000 ))
+          ATTEMPT=0
+          while :; do
+            ATTEMPT=$(( ATTEMPT + 1 ))
+            OUT=$(oci compute instance launch \
+              --auth api_key \
+              --availability-domain "$AD" \
+              --compartment-id "$COMPARTMENT" \
+              --shape VM.Standard.A1.Flex \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BOOT_VOLUME\"}" \
+              --subnet-id "$SUBNET" \
+              --assign-public-ip true \
+              --display-name Hermes 2>&1)
+
+            if echo "$OUT" | grep -q '"lifecycle-state"'; then
+              echo "attempt $ATTEMPT: BOOKED"
+              break
+            elif echo "$OUT" | grep -qi 'NotAuthenticated\|Unauthorized'; then
+              echo "attempt $ATTEMPT: AUTH FAILURE"
+              break
+            elif echo "$OUT" | grep -qi 'LimitExceeded\|QuotaExceeded'; then
+              # An instance appeared from elsewhere - stop rather than spin.
+              echo "attempt $ATTEMPT: limit exceeded, an instance already exists"
+              break
+            elif echo "$OUT" | grep -q 'Out of host capacity'; then
+              echo "attempt $ATTEMPT: out of host capacity"
+              SLEEP=180
+            elif echo "$OUT" | grep -q 'TooManyRequests'; then
+              echo "attempt $ATTEMPT: rate limited (429) - backing off"
+              SLEEP=300
+            else
+              echo "attempt $ATTEMPT: unexpected error:"
+              echo "$OUT" | grep -v SyntaxWarning | grep -v INSTANCE_CONSOLE | head -8
+              SLEEP=180
+            fi
+            # Stop before the job timeout; the next scheduled run picks it up.
+            [ "$(date +%s)" -ge "$DEADLINE" ] && { echo "window closed after $ATTEMPT attempts"; break; }
+            sleep "$SLEEP"
+          done
+          echo "attempts=$ATTEMPT" >> "$GITHUB_OUTPUT"
           echo "$OUT" | grep -v SyntaxWarning | grep -v INSTANCE_CONSOLE | head -20
 
           if echo "$OUT" | grep -q '"lifecycle-state"'; then
