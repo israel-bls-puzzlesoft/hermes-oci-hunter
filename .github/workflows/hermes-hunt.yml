@@ -78,6 +78,10 @@ jobs:
           elif echo "$OUT" | grep -qi 'NotAuthenticated\|Unauthorized'; then
             echo "booked=error" >> "$GITHUB_OUTPUT"
             echo "AUTH FAILURE - check the OCI_CLI_* secrets."
+          elif echo "$OUT" | grep -q 'TooManyRequests'; then
+            echo "booked=false" >> "$GITHUB_OUTPUT"
+            echo "RATE LIMITED (429) - this round tested nothing. If this repeats"
+            echo "every round, another hunter is competing on the same OCI user."
           else
             echo "booked=false" >> "$GITHUB_OUTPUT"
             echo "Other error (see above) - will retry."
